@@ -1,35 +1,38 @@
 import argparse
-import yaml
-import coloredlogs
+import firebase_admin
+from firebase_admin import credentials, firestore
+import envyaml
 import json
 import logging
 import os
 import datetime
-import pushover
-import shelve
-import schedule
 import requests
-import time
 
-from slack_sdk import WebClient
-
-coloredlogs.install(level="INFO")
-log = logging.getLogger("main")
-
+log = logging.getLogger()
 
 class LuxMedSniper:
     LUXMED_LOGIN_URL = 'https://portalpacjenta.luxmed.pl/PatientPortalMobileAPI/api/token'
     NEW_PORTAL_RESERVATION_URL = 'https://portalpacjenta.luxmed.pl/PatientPortalMobileAPI/api/visits/available-terms'
 
     def __init__(self, configuration_file="luxmedSniper.yaml"):
-        self.log = logging.getLogger("LuxMedSniper")
+        self.log = logging.getLogger()
         self.log.info("LuxMedSniper logger initialized")
         self._loadConfiguration(configuration_file)
         self._createSession()
         self._logIn()
-        pushover.init(self.config['pushover']['api_token'])
-        self.pushoverClient = pushover.Client(self.config['pushover']['user_key'])
-        self.slackClient = WebClient(token=self.config['slack']['api_token'])
+        self._load_appointments()
+
+    def _load_appointments(self):
+        cred = credentials.Certificate(
+            self.config['firebase']['firebase_key']
+        )
+        firebase_admin.initialize_app(cred)
+        db = firestore.client()
+        self.seen_appointments_ref = db.document('luxmed-sniper', 'seen-appointments')
+        seen_appointments = self.seen_appointments_ref.get().to_dict()
+        if not seen_appointments:
+            seen_appointments = {}
+        self.seen_appointments = seen_appointments
 
     def _createSession(self):
         self.session = requests.session()
@@ -42,16 +45,11 @@ class LuxMedSniper:
 
     def _loadConfiguration(self, configuration_file):
         try:
-            config_data = open(
-                os.path.expanduser(
-                    configuration_file
-                ),
-                'r'
-            ).read()
+            config_data_path = os.path.expanduser(configuration_file)
         except IOError:
             raise Exception('Cannot open configuration file ({file})!'.format(file=configuration_file))
         try:
-            self.config = yaml.load(config_data, Loader=yaml.FullLoader)
+            self.config = envyaml.EnvYAML(config_data_path)
         except Exception as yaml_error:
             raise Exception('Configuration problem: {error}'.format(error=yaml_error))
 
@@ -119,52 +117,49 @@ class LuxMedSniper:
                 self.log.info('Notification was already sent.')
 
     def _addToDatabase(self, appointment):
-        db = shelve.open(self.config['misc']['notifydb'])
-        notifications = db.get(appointment['DoctorName'], [])
-        notifications.append(appointment['AppointmentDate'])
-        db[appointment['DoctorName']] = notifications
-        db.close()
+        doctor_name = appointment['DoctorName']
+        appointment_date = appointment['AppointmentDate']
+        seen_dates = self.seen_appointments.get(doctor_name, [])
+        seen_dates.append(appointment_date)
+        update_ = {doctor_name: seen_dates}
+        self.seen_appointments.update(update_)
+        self.seen_appointments_ref.set(update_, merge=True)
 
     def _sendNotification(self, appointment):
         try:
-            if self.config['luxmedsniper']['notification_provider'] == "pushover":
-                self.pushoverClient.send_message(self.config['pushover']['message_template'].format(**appointment, title=self.config['pushover']['title']))
-            else:
-                self.slackClient.chat_postMessage(channel=self.config['slack']['channel'], text=self.config['slack']['message_template'].format(**appointment, title=self.config['pushover']['title']))
+            requests.post(
+                'https://api.pushover.net/1/messages.json',
+                data={
+                    'message': self.config['pushover']['message_template'].format(
+                        **appointment, title=self.config['pushover']['title']),
+                    'user': self.config['pushover']['user_key'],
+                    'token': self.config['pushover']['api_token']
+                }
+            )
         except Exception as s:
             log.error(s)
 
     def _isAlreadyKnown(self, appointment):
-        db = shelve.open(self.config['misc']['notifydb'])
-        notifications = db.get(appointment['DoctorName'], [])
-        db.close()
+        notifications = self.seen_appointments.get(appointment['DoctorName'], [])
         if appointment['AppointmentDate'] in notifications:
             return True
         return False
 
 
-def work(config):
-    try:
-        luxmedSniper = LuxMedSniper(configuration_file=config)
-        luxmedSniper.check()
-    except Exception as s:
-        log.error(s)
-
-
-if __name__ == "__main__":
-    log.info("LuxMedSniper - Lux Med Appointment Sniper")
+def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "-c", "--config",
         help="Configuration file path (default: luxmedSniper.yaml)", default="luxmedSniper.yaml"
     )
-    parser.add_argument(
-        "-d", "--delay",
-        type=int, help="Delay in s of fetching updates (default: 1800)", default="1800"
-    )
     args = parser.parse_args()
-    work(args.config)
-    schedule.every(args.delay).seconds.do(work, args.config)
-    while True:
-        schedule.run_pending()
-        time.sleep(1)
+    return args
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    log.info("LuxMedSniper - Lux Med Appointment Sniper")
+    args = parse_args()
+    LuxMedSniper(configuration_file=args.config).check()
+
+
